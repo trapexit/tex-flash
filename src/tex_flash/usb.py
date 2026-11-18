@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Linux hidraw transport for the TEX Shura. No reports are recorded or replayed."""
+"""Linux hidraw transport for supported TEX keyboards. No report capture or replay."""
 
 import fcntl
 import hashlib
@@ -14,20 +14,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar
 
-from .protocol import validate_model
+from .models import Model
+from .protocol import validate_metadata, validate_model
 
 _USB_BUS = Path("/sys/bus/usb/devices")
 _HIDRAW = Path("/sys/class/hidraw")
 _MOUNTINFO = Path("/proc/self/mountinfo")
 _BLOCK_DEVICES = Path("/sys/dev/block")
 _USB_PORT = re.compile(r"([0-9]+)-([1-9][0-9]*(?:\.[1-9][0-9]*)*)")
-_QMK_NAMES = {"Shura", "Shura experimental"}
+_QMK_NAMES = {Model.SHURA: {"Shura", "Shura experimental"}, Model.SHINOBI: {"Shinobi"}}
 # Exact fingerprints of the unnumbered reports, not just their usage prefix.
 _STOCK_RAW = "23e33901919ad6b26a0321a9637b177734d7d7a40d6167fb37811fa2c7a017e7"
 _IAP_KEYBOARD = "816047140f3c21b699dbf4c15ebe253abc5c1e2a72bbf53ff7397d796ca76a8e"
+# Stock 4.04 (flash 0x9b94) and released Shinobi QMK v1.2 (0x9cb2)
+# both have raw interface 1, but distinct complete report descriptors.
+_QMK_TEX_RAW = "7fe330b991174d7584ea423fcbbd4b58479de2f3dc0827305244aafc057c2945"
 _QMK_RAW = {
-    # FF00/01, 64-byte Shura raw HID; FF60/61, 32-byte VIA raw HID.
-    "7fe330b991174d7584ea423fcbbd4b58479de2f3dc0827305244aafc057c2945": (64, b"\x11\x00"),
+    # FF00/01, 64-byte TEX raw HID; FF60/61, 32-byte Shura VIA raw HID.
+    _QMK_TEX_RAW: (64, b"\x11\x00"),
     "b464b2658e8e41b89af847112efa3c3059c330864e10094425c0b92d55e24d89": (32, b"\xf1\x00"),
 }
 
@@ -61,30 +65,34 @@ class _Device:
     serial: str | None = field(repr=False)
     bus: int
     number: int
+    model: Model = Model.SHURA
+    revision: str | None = None
 
     @property
     def mode(self) -> str | None:
         if self.vid == "04d9":
-            if self.pid == "1532":
+            if self.pid == self.model.iap_pid:
                 return "iap"
-            if self.pid == "0532":
-                if self.name in _QMK_NAMES and self.manufacturer == "TEX":
+            if self.pid == self.model.app_pid:
+                if (self.name in _QMK_NAMES[self.model] and self.manufacturer == "TEX"
+                        and (self.model is Model.SHURA or self.revision == "0900")):
                     return "qmk"
-                if self.name == "USB-HID Keyboard" and self.serial:
+                if (self.name == "USB-HID Keyboard" and self.serial
+                        and (self.model is Model.SHURA or self.revision == "0410")):
                     return "stock"
         return None
 
 
-def _device(path: Path) -> _Device:
+def _device(path: Path, *, model: Model = Model.SHURA) -> _Device:
     bus, number = (int(_text(path / key)) for key in ("busnum", "devnum"))
     if not path.name.startswith(f"{bus}-") or number <= 0:
         raise ValueError("Inconsistent USB enumeration identity")
     return _Device(path, _text(path / "idVendor"), _text(path / "idProduct"),
                    _optional(path / "product"), _optional(path / "manufacturer"),
-                   _optional(path / "serial"), bus, number)
+                   _optional(path / "serial"), bus, number, model, _optional(path / "bcdDevice"))
 
 
-def _devices(anchor: str | None = None) -> Iterator[_Device]:
+def _devices(anchor: str | None = None, *, model: Model = Model.SHURA) -> Iterator[_Device]:
     for entry in _USB_BUS.iterdir():
         if not _USB_PORT.fullmatch(entry.name):  # exclude interfaces and root hubs
             continue
@@ -93,20 +101,20 @@ def _devices(anchor: str | None = None) -> Iterator[_Device]:
             if _anchor(path) != anchor:
                 continue
         elif (_text(path / "idVendor"), _text(path / "idProduct")) not in {
-                ("04d9", "0532"), ("04d9", "1532")}:
+                ("04d9", model.app_pid), ("04d9", model.iap_pid)}:
             continue
-        yield _device(path)
+        yield _device(path, model=model)
 
 
-def _select(serial: str | None) -> _Device:
+def _select(serial: str | None, *, model: Model = Model.SHURA) -> _Device:
     if serial is not None and (not isinstance(serial, str) or not serial or serial != serial.strip()):
         raise ValueError("Specify the exact nonempty stock USB serial, including leading zeroes")
     if serial is None:
-        matches = [d for d in _devices() if d.mode in {"qmk", "iap"}]
+        matches = [d for d in _devices(model=model) if d.mode in {"qmk", "iap"}]
     else:
-        matches = [d for d in _devices() if d.mode == "stock" and d.serial == serial]
+        matches = [d for d in _devices(model=model) if d.mode == "stock" and d.serial == serial]
     if len(matches) != 1:
-        raise ValueError(f"Expected exactly one matching Shura, found {len(matches)}; "
+        raise ValueError(f"Expected exactly one matching {model.title}, found {len(matches)}; "
                          "stock firmware requires its exact --serial")
     return matches[0]
 
@@ -128,7 +136,8 @@ class _Pending(FileNotFoundError):
 
 
 def _endpoint(device: _Device) -> _Endpoint:
-    if device.mode is None or _device(device.path) != device:
+    mode, model = device.mode, device.model
+    if mode is None or _device(device.path, model=model) != device:
         raise ValueError("Selected USB identity changed")
     found = []
     for entry in _HIDRAW.iterdir():
@@ -144,7 +153,7 @@ def _endpoint(device: _Device) -> _Endpoint:
                 or not re.fullmatch(r"hidraw[0-9]+", entry.name)):
             raise ValueError("Unexpected USB/hidraw interface ancestry")
         number = int(_text(interface / "bInterfaceNumber"), 16)
-        if device.mode == "stock" and number != 1:
+        if mode == "stock" and number != 1:
             continue
         fields = dict(line.split("=", 1) for line in _text(hid / "uevent").splitlines() if "=" in line)
         if (_text(interface / "bInterfaceClass").lower() != "03"
@@ -152,19 +161,22 @@ def _endpoint(device: _Device) -> _Endpoint:
             raise ValueError("USB and HID interface identities disagree")
         descriptor = (hid / "report_descriptor").read_bytes()
         digest = hashlib.sha256(descriptor).hexdigest()
-        if device.mode == "iap" and digest == _IAP_KEYBOARD and number == 0:
+        if mode == "iap" and digest == _IAP_KEYBOARD and (model is Model.SHINOBI or number == 0):
             continue  # never open keyboard input
-        if device.mode == "qmk":
+        if mode == "qmk":
             profile = _QMK_RAW.get(digest)
-            if profile is None:
+            if profile is None or (model is Model.SHINOBI and (digest != _QMK_TEX_RAW or number != 1)):
                 if descriptor.startswith((b"\x06\x00\xff\x09\x01", b"\x06\x60\xff\x09\x61")):
-                    raise ValueError("Unrecognized Shura QMK raw descriptor")
+                    raise ValueError(f"Unrecognized {model.title} QMK raw descriptor or interface")
                 continue
             size, restart = profile
         else:
-            if digest != _STOCK_RAW or number != 1:
-                raise ValueError("Unrecognized Shura vendor interface or descriptor")
-            size, restart = 64, b"\x11\x01" if device.mode == "iap" else b"\x11\x00"
+            # The Shinobi reference selects its IAP vendor page, not an
+            # interface number. Require the full stock 64-byte report shape;
+            # never fall back to a keyboard or an unknown sole interface.
+            if digest != _STOCK_RAW or (model is Model.SHURA and number != 1):
+                raise ValueError(f"Unrecognized {model.title} vendor interface or descriptor")
+            size, restart = 64, b"\x11\x01" if mode == "iap" else b"\x11\x00"
         dev = _text(entry / "dev")
         if not re.fullmatch(r"[0-9]+:[0-9]+", dev):
             raise ValueError("Invalid hidraw device number")
@@ -172,11 +184,11 @@ def _endpoint(device: _Device) -> _Endpoint:
         found.append(_Endpoint(device, hid, number, Path("/dev") / entry.name, os.makedev(major, minor),
                                digest, size, restart))
     if not found:
-        if device.mode == "qmk":
-            raise _Pending("No supported QMK raw endpoint; hold Escape while connecting the Shura")
-        raise _Pending("The Shura vendor hidraw endpoint is not present")
+        if mode == "qmk":
+            raise _Pending(f"No supported QMK raw endpoint; hold Escape while connecting the {model.title}")
+        raise _Pending(f"The {model.title} vendor hidraw endpoint is not present")
     if len(found) != 1:
-        raise ValueError("Ambiguous Shura vendor interfaces")
+        raise ValueError(f"Ambiguous {model.title} vendor interfaces")
     return found[0]
 
 
@@ -196,17 +208,20 @@ def _wait(probe: Callable[[], _T], seconds: float) -> _T:
 
 
 def _successor(before: _Device, modes: set[str]) -> _Device:
-    matches = list(_devices(_anchor(before.path)))
+    model = before.model
+    matches = list(_devices(_anchor(before.path), model=model))
     if not matches or matches == [before]:
         raise _Pending("The original port has not re-enumerated")
     if len(matches) != 1:
         raise ValueError("Ambiguous USB identity on the original port")
     device = matches[0]
-    if ((device.vid, device.pid) == ("04d9", "0532")
-            and (not device.name or (device.name in _QMK_NAMES and not device.manufacturer)
-                 or (device.name == "USB-HID Keyboard" and not device.serial))):
+    if ((device.vid, device.pid) == ("04d9", model.app_pid)
+            and (not device.name or (device.name in _QMK_NAMES[model] and not device.manufacturer)
+                 or (device.name == "USB-HID Keyboard" and not device.serial)
+                 or (model is Model.SHINOBI and not device.revision))):
         raise _Pending("Application USB identity attributes have not appeared")
-    if device.mode not in modes:
+    if (device.mode not in modes or device.model is not model
+            or (device.bus, device.number) == (before.bus, before.number)):
         raise ValueError("Unexpected USB identity on the original port")
     return device
 
@@ -223,7 +238,7 @@ def _require_unmounted(device: _Device) -> None:
         except FileNotFoundError:  # pseudo-filesystem, not a Linux block device
             continue
         if child.is_relative_to(device.path):
-            raise ValueError("Unmount the Shura configuration disk before changing mode")
+            raise ValueError(f"Unmount the {device.model.title} configuration disk before changing mode")
 
 
 class _Channel:
@@ -258,7 +273,7 @@ class _Channel:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise ValueError("Another process owns this Shura hidraw session") from exc
+                raise ValueError("Another process owns this keyboard's hidraw session") from exc
         except BaseException:
             self.close()
             raise
@@ -319,18 +334,21 @@ class _Channel:
             self.close()  # disconnect is expected; never read or retry this report
 
 
-def _stock_metadata(channel: _Channel) -> bytes:
+def _stock_metadata(channel: _Channel, *, model: Model) -> bytes:
     def query(subcommand: int) -> bytes:
         return channel.exchange(bytes((0x12, subcommand)) + bytes(62))
 
-    validate_model(query(0))
+    validate_model(query(0), model=model)
     selector = query(1)
-    if selector[4] != 4 or int.from_bytes(selector[6:8], "little") > 7:
+    if (selector[4] != 4 or int.from_bytes(selector[6:8], "little") > 7
+            or (model is Model.SHINOBI and selector[4:8] != b"\x04\x00\x02\x00")):
         raise ValueError("Unexpected stock record selector")
     data = b"".join(query(subcommand)[4:] for subcommand in range(0x20, 0x28))
     if data[180:] != b"\xff" * 300:
         raise ValueError("The stock metadata has a non-erased tail that cannot be restored")
-    return data[:180]
+    metadata = data[:180]
+    validate_metadata(metadata, model=model)
+    return metadata
 
 
 class BootloaderSession:
@@ -355,26 +373,29 @@ class BootloaderSession:
             self._channel.close()
             raise ValueError("Application return was not sent")
         device = _wait(lambda: _successor(self._channel.endpoint.device, {"stock", "qmk"}), 15.0)
-        if device.mode == "stock":
-            if self._stock_serial is not None and device.serial != self._stock_serial:
-                raise ValueError("Returned stock serial differs from the selected device")
+        if device.mode == "stock" and self._stock_serial is not None and device.serial != self._stock_serial:
+            raise ValueError("Returned stock serial differs from the selected device")
+        if device.mode == "stock" or device.model is Model.SHINOBI:
             _wait(lambda: _endpoint(device), 5.0)
-        return f"{device.mode} 04d9:0532"
+        return f"{device.mode} {device.vid}:{device.pid}"
 
 
 @contextmanager
-def open_bootloader(serial: str | None = None, *, iap_only: bool = False) -> Iterator[BootloaderSession]:
-    """Select a Shura. Recovery (iap_only) never restarts an application."""
-    original = _select(serial)
+def open_bootloader(serial: str | None = None, *, iap_only: bool = False,
+                    model: Model = Model.SHURA) -> Iterator[BootloaderSession]:
+    """Select only the requested model. Recovery never restarts an application."""
+    original = _select(serial, model=model)
     if iap_only and original.mode != "iap":
-        raise ValueError("Recovery requires a Shura already in its bootloader")
+        raise ValueError(f"Recovery requires a {model.title} already in its bootloader")
     _anchor(original.path)  # require a usable anchor before issuing any request
     endpoint = _wait(lambda: _endpoint(original), 5.0)
     metadata = None
     if original.mode != "iap":
         with _Channel(endpoint) as app:
-            if original.mode == "stock":
-                metadata = _stock_metadata(app)
+            # Released Shinobi QMK implements the same read-only queries as
+            # stock. Check its version block too, before requesting any reset.
+            if original.mode == "stock" or model is Model.SHINOBI:
+                metadata = _stock_metadata(app, model=model)
             app.change_mode()
         iap = _wait(lambda: _successor(original, {"iap"}), 15.0)
         endpoint = _wait(lambda: _endpoint(iap), 5.0)

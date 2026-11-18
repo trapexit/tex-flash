@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Grant the active local user hidraw access in Shura application and IAP modes.
+# Grant the active local user hidraw access in Shura and Shinobi application and IAP modes.
 SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="0532", TAG+="uaccess"
 SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="1532", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="0407", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="1407", TAG+="uaccess"

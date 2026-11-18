@@ -46,3 +46,18 @@ class CliTests(unittest.TestCase):
             self.assertNotIn("Application returned:", output.getvalue())
             self.assertIn("Expected stock", errors.getvalue())
             self.assertTrue(backup.is_file())
+
+    def test_unapproved_updater_never_switches_a_keyboard_to_bootloader(self):
+        # Trigger real image admission through the public CLI, not USB's own checks.
+        with tempfile.TemporaryDirectory() as directory, patch.object(cli, "open_bootloader") as usb:
+            root = Path(directory)
+            updater = root / "AP_0407_4.04.exe"
+            # Even a package of the correct length and with the expected filename
+            # cannot authorize a USB action without the approved model digest.
+            updater.write_bytes(bytes(3011460))
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+                result = cli.main(["flash", "--model", "shinobi", "--stock", "--updater", str(updater),
+                                   "--backup", str(root / "backup.json")])
+            self.assertNotEqual(0, result)
+            self.assertIn("Shinobi", errors.getvalue())
+            usb.assert_not_called()

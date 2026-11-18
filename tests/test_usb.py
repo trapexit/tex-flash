@@ -6,18 +6,33 @@ import os
 import stat
 import tempfile
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from tex_flash import usb
+from tex_flash.models import Model
 
 
 def write_fields(path, **fields):
     path.mkdir(parents=True, exist_ok=True)
     for key, value in fields.items():
         (path / key).write_text(value + "\n", encoding="utf-8")
+
+
+def raw_descriptor(*, qmk=False, via=False):
+    """Build unnumbered vendor Input and Output reports using HID short items."""
+    usage = b"\x06\x60\xff\x09\x61" if via else b"\x06\x00\xff\x09\x01"
+    count = 32 if via else 64
+    fields = bytes((0x95, count, 0x75, 8)) if qmk else bytes((0x75, 8, 0x95, count))
+
+    def report(usage_id, main_item):
+        return bytes((9, usage_id, 0x15, 0, 0x26, 255, 0)) + fields + bytes((main_item, 2))
+
+    base = 0x62 if qmk else 2
+    return usage + bytes((0xa1, 1)) + report(base, 0x81) + report(base + 1, 0x91) + b"\xc0"
 
 
 class TopologyTests(unittest.TestCase):
@@ -34,12 +49,12 @@ class TopologyTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def device(self, port, pid, name, serial="serial-for-test"):
+    def device(self, port, pid, name, serial="serial-for-test", *, model=Model.SHURA, revision="0000"):
         path = self.root / "controller" / "usb2" / port
         write_fields(path, idVendor="04d9", idProduct=pid, product=name, serial=serial,
-                     manufacturer="TEX", busnum="2", devnum="13")
+                     manufacturer="TEX", busnum="2", devnum="13", bcdDevice=revision)
         (self.bus / port).symlink_to(path)
-        return usb._device(path)
+        return usb._device(path, model=model)
 
     def endpoint(self, dev, iface, index, descriptor):
         interface = dev.path / f"{dev.path.name}:1.{iface}"
@@ -71,6 +86,100 @@ class TopologyTests(unittest.TestCase):
         self.device("2-4", "0532", "USB-HID Keyboard", "test-007")
         with self.assertRaisesRegex(ValueError, "found 2"):
             usb._select("test-007")
+
+    def test_exact_stock_serial_cannot_select_other_model(self):
+        shura = self.device("2-1", "0532", "USB-HID Keyboard", "one")
+        shinobi = self.device("2-2", "0407", "USB-HID Keyboard", "two", model=Model.SHINOBI, revision="0410")
+        for wanted, other in ((shura, shinobi), (shinobi, shura)):
+            with self.subTest(model=wanted.model), patch.object(usb, "_Channel") as channel:
+                self.assertEqual(usb._select(wanted.serial, model=wanted.model), wanted)
+                with self.assertRaisesRegex(ValueError, "found 0"), usb.open_bootloader(other.serial, model=wanted.model):
+                    self.fail("selected the other keyboard")
+                channel.assert_not_called()
+        write_fields(shinobi.path, bcdDevice="0310")
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            usb._select(shinobi.serial, model=Model.SHINOBI)
+
+    def test_each_model_recovers_only_its_iap_even_with_both_connected(self):
+        shura = self.device("2-1", "1532", "loader")
+        shinobi = self.device("2-2", "1407", "loader", model=Model.SHINOBI)
+        for index, dev in enumerate((shura, shinobi), 1):
+            self.endpoint(dev, 1, index, raw_descriptor())
+        for dev in (shura, shinobi):
+            with self.subTest(model=dev.model), patch.object(usb, "_Channel") as channel:
+                entered = channel.return_value.__enter__.return_value
+                entered.endpoint = usb._endpoint(dev)
+                with usb.open_bootloader(model=dev.model, iap_only=True):
+                    ep = channel.call_args.args[0]
+                    self.assertEqual((ep.device, ep.size, ep.restart), (dev, 64, b"\x11\x01"))
+                entered.change_mode.assert_not_called()
+
+    def test_shinobi_loader_rejects_unknown_sole_interface(self):
+        dev = self.device("2-1", "1407", "loader", model=Model.SHINOBI)
+        self.endpoint(dev, 0, 1, raw_descriptor()[:-1])
+        with self.assertRaisesRegex(ValueError, "descriptor"):
+            usb._endpoint(dev)
+
+    def test_shinobi_app_selection_excludes_bluetooth_and_unknown_names(self):
+        self.device("2-1", "2521", "Shinobi", revision="0900")
+        self.device("2-2", "0407", "Shura", revision="0900")
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            usb._select(None, model=Model.SHINOBI)
+
+    def test_shinobi_app_checks_info_version_and_readable_tail_before_reset(self):
+        # The two Shinobi package generations share compatibility fields.
+        # Even a matching USB revision and selector cannot replace the version check.
+        shinobi_info = bytes.fromhex("00000000 d9040714 00510404 ffffffff 0100")
+        shura_info = bytes.fromhex("00000000 d9043215 c0510404 ffffffff 0100")
+        for index, qmk in enumerate((True, False), 1):
+            name, revision = ("Shinobi", "0900") if qmk else ("USB-HID Keyboard", "0410")
+            app = self.device(f"2-{index}", "0407", name, model=Model.SHINOBI, revision=revision)
+            hid = self.endpoint(app, 1, index, raw_descriptor(qmk=qmk))
+            for info, version, tail, error in (
+                (shura_info, "V1.04.04", 255, "Incompatible"),
+                (shinobi_info, "V1.03.01", 255, "4.04"),
+                (shinobi_info, "V1.04.04", 0, "tail"),
+                (shinobi_info, "V1.04.04", 255, None),
+            ):
+                data = bytearray(180) + bytearray([255]) * 300
+                data[:2] = b"\x1a\x00"
+                data[4:22] = (version + "\0").encode("utf-16le")
+                data[0x90:0x94] = b"\xd9\x04\x07\x04"
+                data[176:178] = b"\xa5\x5a"
+                data[-1] = tail
+
+                def reply(payload):
+                    sub = payload[1]
+                    if sub == 0:
+                        return (payload[:8] + info).ljust(64, b"\x00")
+                    if sub == 1:
+                        return payload[:4] + bytes.fromhex("04 00 02 00") + bytes(56)
+                    self.assertIn(sub, range(0x20, 0x28))
+                    start = (sub - 0x20) * 60
+                    return payload[:4] + bytes(data[start:start + 60])
+
+                def enter_iap():
+                    write_fields(app.path, idProduct="1407", devnum="14")
+                    write_fields(hid, uevent="HID_ID=0003:000004D9:00001407")
+                    (hid / "report_descriptor").write_bytes(raw_descriptor())
+
+                reset = Mock(side_effect=enter_iap)
+
+                @contextmanager
+                def channel(ep):
+                    yield Mock(endpoint=ep, exchange=reply, change_mode=reset)
+
+                with self.subTest(qmk=qmk, error=error), patch.object(usb, "_Channel", channel):
+                    session = usb.open_bootloader(None if qmk else app.serial, model=Model.SHINOBI)
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error), session:
+                            self.fail("unsafe mode switch")
+                        reset.assert_not_called()
+                    else:
+                        with session as loader:
+                            self.assertEqual(loader.app_metadata, bytes(data[:180]))
+                            self.assertEqual(loader.anchor, usb._anchor(app.path))
+                        reset.assert_called_once_with()
 
     def test_iap_only_never_opens_or_restarts_an_application(self):
         self.device("2-1", "0532", "USB-HID Keyboard", "test-007")
@@ -121,19 +230,48 @@ class TopologyTests(unittest.TestCase):
     def test_qmk_restart_reports_have_complete_descriptor_guards(self):
         dev = self.device("2-2", "0532", "Shura")
         hid = self.endpoint(dev, 1, 4, b"initial")
-        for usage, count, opcode in ((b"\x06\x00\xff\x09\x01", 64, 0x11),
-                                     (b"\x06\x60\xff\x09\x61", 32, 0xf1)):
-            # Construct the public QMK RawReport shape, independently of the digest table.
-            def report(usage_id, main_item):
-                return bytes((9, usage_id, 0x15, 0, 0x26, 255, 0, 0x95, count,
-                              0x75, 8, main_item, 2))
-            descriptor = usage + bytes((0xa1, 1)) + report(0x62, 0x81) + report(0x63, 0x91) + b"\xc0"
+        for via, count, opcode in ((False, 64, 0x11), (True, 32, 0xf1)):
+            descriptor = raw_descriptor(qmk=True, via=via)
             (hid / "report_descriptor").write_bytes(descriptor)
             ep = usb._endpoint(dev)
             self.assertEqual((ep.size, ep.restart), (count, bytes((opcode, 0))))
             (hid / "report_descriptor").write_bytes(descriptor[:-1])
             with self.assertRaisesRegex(ValueError, "descriptor"):
                 usb._endpoint(dev)
+
+    def test_shinobi_qmk_rejects_shura_via_descriptor(self):
+        dev = self.device("2-1", "0407", "Shinobi", model=Model.SHINOBI, revision="0900")
+        hid = self.endpoint(dev, 1, 1, raw_descriptor(qmk=True))
+        ep = usb._endpoint(dev)
+        self.assertEqual((ep.size, ep.restart), (64, b"\x11\x00"))
+        (hid / "report_descriptor").write_bytes(raw_descriptor(qmk=True, via=True))
+        with self.assertRaisesRegex(ValueError, "descriptor"):
+            usb._endpoint(dev)
+
+    def test_successor_rejects_other_model_on_selected_port_both_directions(self):
+        for port, model, other in (("2-1", Model.SHURA, Model.SHINOBI), ("2-2", Model.SHINOBI, Model.SHURA)):
+            with self.subTest(model=model):
+                before = self.device(port, model.app_pid, model.title, model=model, revision="0900")
+                write_fields(before.path, idProduct=other.iap_pid, devnum="14")
+                with self.assertRaisesRegex(ValueError, "Unexpected"):
+                    usb._successor(before, {"iap"})
+                write_fields(before.path, idProduct=model.iap_pid)
+                iap = usb._successor(before, {"iap"})
+                write_fields(before.path, idProduct=other.app_pid, product=other.title, devnum="15")
+                with self.assertRaisesRegex(ValueError, "Unexpected"):
+                    usb._successor(iap, {"stock", "qmk"})
+
+    def test_returned_shinobi_requires_model_and_raw_endpoint(self):
+        iap = self.device("2-1.3", "1407", "loader", model=Model.SHINOBI)
+        session = usb.BootloaderSession(Mock(endpoint=Mock(device=iap)), None, None)
+        session.return_application()
+        write_fields(iap.path, idProduct="0407", product="Shinobi", devnum="19", bcdDevice="0900")
+        app = usb._device(iap.path, model=Model.SHINOBI)
+        hid = self.endpoint(app, 1, 3, raw_descriptor(qmk=True, via=True))
+        with self.assertRaisesRegex(ValueError, "descriptor"):
+            session.wait_application()
+        (hid / "report_descriptor").write_bytes(raw_descriptor(qmk=True))
+        self.assertEqual(session.wait_application(), "qmk 04d9:0407")
 
     def test_wait_requires_new_mode_on_same_controller_port(self):
         iap = self.device("2-1.3", "1532", "loader")

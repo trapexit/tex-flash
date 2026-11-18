@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Entirely synthetic fixtures. No vendor firmware, transfer key or keyboard needed."""
 
+from dataclasses import replace
 import hashlib
 from pathlib import Path
 import struct
@@ -9,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from tex_flash import image
+from tex_flash.models import Model
 
 
 def digest(data):
@@ -35,16 +37,17 @@ RECORD = bytes(range(12))
 
 def pair(length=0xA40, *, stack=RAM + 256, pstack=RAM + 512, reset=BASE + 17,
          entry=None, vector=0, record=RECORD, pid=0x0532, keymap_size=704,
-         ram_size=512, text_flags=6, data_at=BASE, keymap_name=b"keymaps"):
+         keymap_at=BASE + 64, ram_size=512, text_flags=6, data_at=BASE, keymap_name=b"keymaps",
+         mapped_headers=False):
     """Build a real ELF32 with two load segments, symbols, strings and SRAM NOBITS."""
     flat = bytearray(length)
     struct.pack_into("<III", flat, 0, stack, reset, vector)
     struct.pack_into("<HH", flat, 40, 0x04D9, pid)
     flat[32:34] = b"\x12\x01"
     flat[0x9F8:0xA04] = record
-    flat[64] = 0xA5  # custom mapping is allowed
+    flat[keymap_at - BASE] = 0xA5  # custom mapping is allowed
 
-    dataoff = 0x100
+    dataoff = 0x200 if mapped_headers else 0x100
     data = bytearray(dataoff) + flat
     names = b"\0.vectors\0.text\0.rodata\0.bss\0.symtab\0.strtab\0.shstrtab\0"
     strings = b"\0__main_stack_end__\0__process_stack_end__\0DeviceDescriptor\0" + keymap_name + b"\0"
@@ -52,7 +55,7 @@ def pair(length=0xA40, *, stack=RAM + 256, pstack=RAM + 512, reset=BASE + 17,
     data.extend(bytes(16))  # ELF null symbol
     for name, address, size, section in [
         (b"__main_stack_end__", RAM + 256, 0, 4), (b"__process_stack_end__", pstack, 0, 4),
-        (b"DeviceDescriptor", BASE + 32, 18, 3), (keymap_name, BASE + 64, keymap_size, 3),
+        (b"DeviceDescriptor", BASE + 32, 18, 3), (keymap_name, keymap_at, keymap_size, 3),
     ]:
         data.extend(struct.pack("<IIIBBH", strings.index(name), address, size, 0x11, 0, section))
     stroff = len(data)
@@ -74,7 +77,9 @@ def pair(length=0xA40, *, stack=RAM + 256, pstack=RAM + 512, reset=BASE + 17,
     ident = b"\x7fELF\x01\x01\x01".ljust(16, b"\0")
     struct.pack_into("<16sHHIIIIIHHHHHH", data, 0, ident, 2, 40, 1, reset if entry is None else entry,
                      52, shoff, 0, 52, 32, 2, 40, 8, 7)
-    struct.pack_into("<8I", data, 52, 1, dataoff, BASE, data_at, length, length, 5, 4)
+    prefix = dataoff if mapped_headers else 0
+    struct.pack_into("<8I", data, 52, 1, dataoff - prefix, BASE - prefix, data_at - prefix,
+                     length + prefix, length + prefix, 5, 4)
     struct.pack_into("<8I", data, 84, 1, 0, RAM, RAM, 0, ram_size, 6, 4)
     return bytes(flat), bytes(data)
 
@@ -85,17 +90,20 @@ class AdmissionTests(unittest.TestCase):
         self.addCleanup(root.cleanup)
         root = Path(root.name)
         self.updater, self.binary, self.elf = (root / name for name in ("updater", "image.bin", "image.elf"))
-        self.plain = bytearray([255]) * image.SLOT_SIZE
-        self.plain[0x9F8:0xA04] = RECORD
+        self.install_package(Model.SHURA, RECORD)
+
+    def install_package(self, model, record):
+        self.plain = bytearray([255]) * model.slot_size
+        self.plain[0x9F8:0xA04] = record
         self.key = bytes(range(image.BLOCK_SIZE))
         self.slot = self.xor(self.plain)
         exe = b"synthetic" + encode_slot(self.slot) + b"end"
         self.updater.write_bytes(exe)
-        pins = patch.multiple(image, UPDATER_SIZE=len(exe), SLOT_OFFSET=len(b"synthetic"),
-                              UPDATER_SHA256=digest(exe), SLOT_SHA256=digest(self.slot),
-                              KEY_SHA256=digest(self.key), PLAIN_SHA256=digest(self.plain))
-        pins.start()
-        self.addCleanup(pins.stop)
+        package = replace(image._PACKAGES[model], size=len(exe), slot_offset=len(b"synthetic"),
+                          sha256=digest(exe), slot_sha256=digest(self.slot), plain_sha256=digest(self.plain))
+        for pins in (patch.dict(image._PACKAGES, {model: package}), patch.object(image, "KEY_SHA256", digest(self.key))):
+            pins.start()
+            self.addCleanup(pins.stop)
 
     def xor(self, data):
         return bytes(v ^ self.key[i % len(self.key)] for i, v in enumerate(data))
@@ -137,9 +145,12 @@ class AdmissionTests(unittest.TestCase):
 
     def test_slot_key_and_plaintext_independently_pinned(self):
         self.inputs()
-        for field in ("SLOT_SHA256", "KEY_SHA256", "PLAIN_SHA256"):
-            with self.subTest(field=field), patch.object(image, field, "0" * 64), self.assertRaises(ValueError):
+        for field in ("slot_sha256", "plain_sha256"):
+            bad = replace(image._PACKAGES[Model.SHURA], **{field: "0" * 64})
+            with self.subTest(field=field), patch.dict(image._PACKAGES, {Model.SHURA: bad}), self.assertRaises(ValueError):
                 self.qmk()
+        with patch.object(image, "KEY_SHA256", "0" * 64), self.assertRaisesRegex(ValueError, "transfer key"):
+            self.qmk()
 
     def test_reject_symlink_without_opening_target(self):
         self.binary.symlink_to(self.updater)
@@ -176,3 +187,57 @@ class AdmissionTests(unittest.TestCase):
             self.elf.write_bytes(bad)
             with self.assertRaises(ValueError):
                 self.qmk()
+
+    def test_packages_and_qmk_images_cannot_cross_models(self):
+        with self.assertRaisesRegex(ValueError, "Shinobi 4.04"):
+            image.load_image(self.updater, model=Model.SHINOBI)
+        self.install_package(Model.SHINOBI, RECORD[::-1])
+        with self.assertRaisesRegex(ValueError, "Shura"):
+            image.load_image(self.updater)
+        self.inputs()
+        with self.assertRaisesRegex(ValueError, "record"):
+            image.load_image(self.updater, self.binary, self.elf, model=Model.SHINOBI)
+
+    def test_unsupported_updater_identified_by_content(self):
+        with patch.object(image, "SHINOBI_301_SHA256", digest(self.updater.read_bytes())):
+            with self.assertRaisesRegex(ValueError, r"3\.01 is not supported"):
+                image.load_image(self.updater, model=Model.SHINOBI)
+
+    def test_shinobi_stock_and_custom_qmk(self):
+        model = Model.SHINOBI
+        self.install_package(model, RECORD)
+        self.assertEqual(image.load_image(self.updater, model=model), self.slot)
+        fields = {"pid": 0x0407, "keymap_at": 0x3800, "keymap_size": 4 * 8 * 15 * 2, "mapped_headers": True}
+        flat = self.inputs(**fields)
+        encoded = image.load_image(self.updater, self.binary, self.elf, model=model)
+        self.assertEqual(self.xor(encoded), flat.ljust(model.slot_size, b"\xff"))
+        # A prefix may contain linker headers and zeros, never flash payload.
+        elf = bytearray(self.elf.read_bytes())
+        elf[0x1ff] = 1
+        self.elf.write_bytes(elf)
+        with self.assertRaisesRegex(ValueError, "before Shinobi vectors"):
+            image.load_image(self.updater, self.binary, self.elf, model=model)
+        for edits, expected in [({"pid": 0x0532}, "04d9:0407"), ({"keymap_size": 704}, "keymaps"),
+                                ({"keymap_at": 0x3804}, "0x3800"), ({"record": bytes(12)}, "record"),
+                                ({"length": model.slot_size + 1}, "limit")]:
+            with self.subTest(edits=edits):
+                self.inputs(**(fields | edits))
+                with self.assertRaisesRegex(ValueError, expected):
+                    image.load_image(self.updater, self.binary, self.elf, model=model)
+
+    def test_shinobi_bin_only_is_an_exact_model_scoped_release_pin(self):
+        model = Model.SHINOBI
+        self.install_package(model, RECORD)
+        flat = self.inputs(pid=0x0407, keymap_at=0x3800, keymap_size=960)
+        with patch.object(image, "SHINOBI_RELEASE_SHA256", digest(flat)):
+            encoded = image.load_image(self.updater, self.binary, model=model)
+            self.assertEqual(self.xor(encoded), flat.ljust(model.slot_size, b"\xff"))
+            with self.assertRaisesRegex(ValueError, "both"):
+                image.load_image(self.updater, self.binary)
+            # Even the pinned release cannot bypass validation of a supplied ELF.
+            self.elf.write_bytes(b"not its ELF")
+            with self.assertRaisesRegex(ValueError, "ELF"):
+                image.load_image(self.updater, self.binary, self.elf, model=model)
+            self.binary.write_bytes(flat[:-1] + b"\x42")
+            with self.assertRaisesRegex(ValueError, "exact published"):
+                image.load_image(self.updater, self.binary, model=model)
