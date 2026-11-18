@@ -1,6 +1,6 @@
 # tex-flash
 
-Install QMK or the official stock application on a **TEX Shura** or **TEX Shinobi BLE5 (4.04)** over USB from Linux. `tex-flash` uses the keyboard's existing TEX bootloader. It does not run Windows executables, build QMK, or update a Bluetooth module.
+Install QMK or the official stock application on a **TEX Shura** or **TEX Shinobi** over USB from Linux. `tex-flash` uses the keyboard's existing TEX bootloader. It does not run Windows executables, build QMK, or update a Bluetooth module.
 
 **Experimental.** The standalone tool has not been tested end-to-end on hardware. An earlier implementation installed QMK on one Shura; an offline replay matched all 662 requests and accepted its replies. Shinobi support is based on [Mauro DiBenedetto's hardware-tested 4.04 port and flasher](https://github.com/cyclistmass/tex-qmk/blob/bf4a40841d3b3ecd226fc2e0ebb09cdc67b1c7da/shinobi/PORT_NOTES.md#flashing), not a live Linux Shinobi test.
 
@@ -33,7 +33,7 @@ The updater must be an original executable extracted from [TEX Downloads](https:
 | Model option | Supported stock package | USB application → bootloader |
 |---|---|---|
 | `--model shura` (default) | `AP_0532_0.18_20230914.exe` | `04d9:0532` → `04d9:1532` |
-| `--model shinobi` | `AP_0407_4.04.exe` (BLE5) | `04d9:0407` → `04d9:1407` |
+| `--model shinobi` | `AP_0407_4.04.exe` | `04d9:0407` → `04d9:1407` |
 
 **Shura:** the required updater SHA-256 is `1b9678d235cecaa7affea40ff8858a2f5993795b24dd7b7d2a34aa7b193c0f99`. For QMK, use the `.bin` and unstripped `.elf` from the **same build**. Supply regular files, not symlinks.
 
@@ -53,7 +53,7 @@ tex-flash check --model shinobi --updater "$updater" --bin ./tex_shinobi_v1.2.bi
 # For a custom build, add --elf ./tex_shinobi_default.elf to its --bin command.
 ```
 
-**Shinobi 3.01 / BLE4 is not supported.** It uses the same USB IDs as 4.04 but has a different stock image and version metadata. This tool does not upgrade a 3.01 installation to 4.04. A Shinobi QMK flash also resets settings stored in the MCU's internal flash, including TrackPoint sensitivity and sleep time.
+**Only Shinobi keyboard firmware 4.04 is supported; 3.01 is not.** The two versions use the same USB IDs but have different stock images and version metadata. The flasher checks the version, not whether a BLE4 or BLE5 module is attached. It does not upgrade a 3.01 installation to 4.04. A Shinobi QMK flash resets settings stored in the MCU's internal flash, including TrackPoint sensitivity and sleep time.
 
 ## Flash over USB
 
