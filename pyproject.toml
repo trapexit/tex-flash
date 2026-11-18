@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tex-flash"
+version = "0.1.0"
+description = "Linux firmware flasher for the TEX Shura keyboard"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Antonio SJ Musumeci" }]
+classifiers = ["Development Status :: 3 - Alpha", "Operating System :: POSIX :: Linux", "Topic :: System :: Hardware"]
+
+[project.scripts]
+tex-flash = "tex_flash.cli:main"
+
+[project.urls]
+Source = "https://github.com/trapexit/tex-flash"
+Issues = "https://github.com/trapexit/tex-flash/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+"share/tex-flash/udev" = ["udev/50-tex-shura.rules"]

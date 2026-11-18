@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+.venv/
+/build/
+/dist/
+/tmp/
+*.exe
+*.rar
+*.bin
+*.elf
+*.backup.json
